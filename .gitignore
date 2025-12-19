@@ -1,0 +1,6 @@
+config.ini
+accounts.db
+active_account_id.txt
+log_*.txt
+__pycache__/
+*.pyc
