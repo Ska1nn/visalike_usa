@@ -1,5 +1,4 @@
-# Embassy List
 Embassies = {
-    "Astana": ["ru-kz", 134, "Продолжить"], # Astana, Kazakhstan
-    "Almaty": ["ru-kz", 135, "Продолжить"], # Almaty, Kazakhstan
+    "Astana": ["ru-kz", 134, "Продолжить"],
+    "Almata": ["ru-kz", 135, "Продолжить"],
 }

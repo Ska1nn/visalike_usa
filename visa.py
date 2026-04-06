@@ -1,17 +1,26 @@
 # visa.py
-import time
-import json
-import logging
-import random
-import requests
-import configparser
-import threading
 import asyncio
-import os
-import sys
+import configparser
 import datetime
+import glob
+import json
+import os
+import pathlib
+import random
 import sqlite3
+import sys
+import threading
+import time
+import traceback
 
+import requests
+import undetected_chromedriver as uc
+from selenium.common.exceptions import TimeoutException
+from selenium.webdriver.common.by import By
+
+# ---------- Selenium ----------
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait as Wait
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
@@ -22,20 +31,13 @@ from telegram.ext import (
     filters
 )
 
-# ---------- Selenium ----------
-from selenium import webdriver
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.ui import WebDriverWait as Wait
-from selenium.webdriver.common.by import By
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
-
 # ---------- Embassy ----------
 from embassy import Embassies
 
 # ---------- DB ----------
 DB_PATH = "accounts.db"
 ACTIVE_ACCOUNT_FILE = "active_account_id.txt"
+
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -55,6 +57,7 @@ def init_db():
     """)
     conn.commit()
     conn.close()
+
 
 def save_account(data, owner_telegram_id):
     conn = sqlite3.connect(DB_PATH)
@@ -77,6 +80,7 @@ def save_account(data, owner_telegram_id):
     conn.close()
     return aid
 
+
 def get_accounts_for_user(owner_telegram_id):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
@@ -87,6 +91,7 @@ def get_accounts_for_user(owner_telegram_id):
     rows = cursor.fetchall()
     conn.close()
     return rows
+
 
 def get_account_by_id(aid):
     conn = sqlite3.connect(DB_PATH)
@@ -108,6 +113,7 @@ def get_account_by_id(aid):
         }
     return None
 
+
 def update_account_field(aid, field, value, owner_telegram_id):
     allowed_fields = {
         "username": "username",
@@ -122,11 +128,13 @@ def update_account_field(aid, field, value, owner_telegram_id):
         return False
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute(f"UPDATE accounts SET {col} = ? WHERE id = ? AND owner_telegram_id = ?", (value, aid, owner_telegram_id))
+    cursor.execute(f"UPDATE accounts SET {col} = ? WHERE id = ? AND owner_telegram_id = ?",
+                   (value, aid, owner_telegram_id))
     updated = cursor.rowcount > 0
     conn.commit()
     conn.close()
     return updated
+
 
 def delete_account_by_id(aid, owner_telegram_id):
     conn = sqlite3.connect(DB_PATH)
@@ -140,9 +148,11 @@ def delete_account_by_id(aid, owner_telegram_id):
     conn.close()
     return deleted
 
+
 def set_active_account(aid):
     with open(ACTIVE_ACCOUNT_FILE, "w") as f:
         f.write(str(aid))
+
 
 def load_active_account():
     try:
@@ -151,6 +161,7 @@ def load_active_account():
         return get_account_by_id(aid)
     except Exception:
         return None
+
 
 # ---------- Runtime Config ----------
 class RuntimeConfig:
@@ -180,21 +191,23 @@ class RuntimeConfig:
             self.OWNER_TELEGRAM_ID = int(config["TELEGRAM"].get("CHAT_ID", 0))
 
         self.EMBASSY = Embassies[self.YOUR_EMBASSY][0]
-        self.FACILITY_ID = Embassies[self.YOUR_EMBASSY][1]
+        self.FACILITY_ID = str(Embassies[self.YOUR_EMBASSY][1]).strip()
         self.REGEX_CONTINUE = Embassies[self.YOUR_EMBASSY][2]
         self.rebuild_urls()
 
     def rebuild_urls(self):
-        # ✅ ИСПРАВЛЕНО: УБРАНЫ ВСЕ ПРОБЕЛЫ!
-        self.SIGN_IN_LINK = f"https://ais.usvisa-info.com/{self.EMBASSY}/niv/users/sign_in"
-        self.APPOINTMENT_URL = f"https://ais.usvisa-info.com/{self.EMBASSY}/niv/schedule/{self.SCHEDULE_ID}/appointment"
-        self.DATE_URL = f"https://ais.usvisa-info.com/{self.EMBASSY}/niv/schedule/{self.SCHEDULE_ID}/appointment/days/{self.FACILITY_ID}.json?appointments[expedite]=false"
-        self.TIME_URL = f"https://ais.usvisa-info.com/{self.EMBASSY}/niv/schedule/{self.SCHEDULE_ID}/appointment/times/{self.FACILITY_ID}.json?date=%s&appointments[expedite]=false"
-        self.SIGN_OUT_LINK = f"https://ais.usvisa-info.com/{self.EMBASSY}/niv/users/sign_out"
+        embassy = str(self.EMBASSY).strip()
+        facility = str(self.FACILITY_ID).strip()
+        base = f"https://ais.usvisa-info.com/{embassy}/niv"
+        self.SIGN_IN_LINK = f"{base}/users/sign_in"
+        self.APPOINTMENT_URL = f"{base}/schedule/{self.SCHEDULE_ID}/appointment"
+        self.DATE_URL = f"{base}/schedule/{self.SCHEDULE_ID}/appointment/days/{facility}.json?appointments[expedite]=false"
+        self.TIME_URL = f"{base}/schedule/{self.SCHEDULE_ID}/appointment/times/%s.json?date=%s&appointments[expedite]=false"
+        self.SIGN_OUT_LINK = f"{base}/users/sign_out"
 
-# ---------- Global Vars ----------
+
 runtime = RuntimeConfig()
-LOG_FILE_NAME = "log_" + str(datetime.date.today()) + ".txt"
+LOG_FILE_NAME = "logs/log_" + str(datetime.date.today()) + ".txt"
 
 config = configparser.ConfigParser()
 config.read("config.ini")
@@ -203,17 +216,6 @@ SENDGRID_API_KEY = config["NOTIFICATION"].get("SENDGRID_API_KEY", "")
 PUSHOVER_TOKEN = config["NOTIFICATION"].get("PUSHOVER_TOKEN", "")
 PUSHOVER_USER = config["NOTIFICATION"].get("PUSHOVER_USER", "")
 
-# Chrome setup
-options = Options()
-options.binary_location = "/Applications/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing"
-options.add_argument("user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.7499.146 Safari/537.36")
-options.add_argument("--disable-blink-features=AutomationControlled")
-options.add_experimental_option("excludeSwitches", ["enable-automation"])
-options.add_experimental_option("useAutomationExtension", False)
-service = Service("/Users/skainn/chromedriver-143/chromedriver-mac-x64/chromedriver")
-driver = webdriver.Chrome(service=service, options=options)
-
-# Time settings
 minute = 60
 hour = 60 * minute
 STEP_TIME = 0.5
@@ -224,24 +226,41 @@ WORK_COOLDOWN_TIME = config["TIME"].getfloat("WORK_COOLDOWN_TIME")
 BAN_COOLDOWN_TIME = config["TIME"].getfloat("BAN_COOLDOWN_TIME")
 REQUEST_COUNT = config["TIME"].getfloat("REQUEST_COUNT")
 
-JS_SCRIPT = (
-    "var req = new XMLHttpRequest();"
-    "req.open('GET', '%s', false);"
-    "req.setRequestHeader('Accept', 'application/json, text/javascript, */*; q=0.01');"
-    "req.setRequestHeader('X-Requested-With', 'XMLHttpRequest');"
-    "req.setRequestHeader('Cookie', '_yatri_session=%s');"
-    "req.send(null);"
-    "return req.responseText;"
-)
+JS_SCRIPT = """
+    return fetch('%s', {
+        method: 'GET',
+        headers: {
+            'Accept': 'application/json, text/javascript, */*; q=0.01',
+            'X-Requested-With': 'XMLHttpRequest'
+        },
+        credentials: 'include'
+    }).then(r => r.text());
+"""
+
+
+def build_cookie_string(driver):
+    cookies = driver.get_cookies()
+    return "; ".join([f"{c['name']}={c['value']}" for c in cookies])
+
 
 # ---------- Utils ----------
 def send_telegram(msg):
     if BOT_TOKEN and runtime.OWNER_TELEGRAM_ID:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"  # ✅ без пробелов
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
         try:
-            requests.post(url, json={"chat_id": runtime.OWNER_TELEGRAM_ID, "text": msg}, timeout=10)
+            requests.post(
+                url,
+                json={
+                    "chat_id": runtime.OWNER_TELEGRAM_ID,
+                    "text": msg,
+                    "parse_mode": "HTML"
+                },
+                timeout=10
+            )
         except Exception as e:
-            print(f"Ошибка отправки в TG: {e}")
+            with open(LOG_FILE_NAME, "a") as f:
+                f.write(f"{datetime.datetime.now()}: Ошибка отправки в TG: {e}\n")
+
 
 def send_notification(title, msg):
     print(f"Sending notification: {title}")
@@ -260,86 +279,390 @@ def send_notification(title, msg):
         except Exception as e:
             print(e)
     if PUSHOVER_TOKEN:
-        url = "https://api.pushover.net/1/messages.json"  # ✅ без пробелов
+        url = "https://api.pushover.net/1/messages.json"
         data = {"token": PUSHOVER_TOKEN, "user": PUSHOVER_USER, "message": msg}
         requests.post(url, data)
 
-def info_logger(file_path, log, send_to_telegram=False):
+
+def info_logger(log, send_to_telegram=False):
     timestamp = str(datetime.datetime.now())
     full_log = f"{timestamp}:\n{log}\n"
     print(full_log)
-    with open(file_path, "a") as f:
-        f.write(full_log)
+
+    # make dir
+    log_dir = os.path.dirname(LOG_FILE_NAME)
+    if log_dir and not os.path.exists(log_dir):
+        os.makedirs(log_dir)
+
+    #with open(LOG_FILE_NAME, "a") as f:
+    #   f.write(full_log)
     if send_to_telegram:
         send_telegram(log)
 
-def auto_action(label, find_by, el_type, action, value="", sleep_time=0):
+
+def clean_old_files(path_pattern, max_count):
+    files = sorted(glob.glob(path_pattern), key=os.path.getmtime)
+    for i in range(len(files) - max_count):
+        os.remove(files[i])
+
+def prepare_log_folders_and_clean():
+    pathlib.Path("logs/screenshots").mkdir(parents=True, exist_ok=True)
+    clean_old_files("logs/*.txt", 5)
+    clean_old_files("logs/screenshots/*.*", 5)
+
+
+def auto_action(driver, label, find_by, el_type, action, value="", sleep_time=0.0):
     print(f"\t{label}:", end="")
-    item = None
-    match find_by.lower():
-        case "id": item = driver.find_element(By.ID, el_type)
-        case "name": item = driver.find_element(By.NAME, el_type)
-        case "class": item = driver.find_element(By.CLASS_NAME, el_type)
-        case "xpath": item = driver.find_element(By.XPATH, el_type)
-        case _: return
-    match action.lower():
-        case "send": item.send_keys(value)
-        case "click": item.click()
-        case _: return
-    print(" Check!")
-    if sleep_time:
-        time.sleep(sleep_time)
-
-# ---------- Visa Logic ----------
-def start_process():
-    driver.get(runtime.SIGN_IN_LINK)
-    time.sleep(STEP_TIME)
-    Wait(driver, 60).until(EC.presence_of_element_located((By.NAME, "commit")))
-    auto_action("Click bounce", "xpath", '//a[@class="down-arrow bounce"]', "click", sleep_time=STEP_TIME)
-    auto_action("Email", "id", "user_email", "send", runtime.USERNAME, STEP_TIME)
-    auto_action("Password", "id", "user_password", "send", runtime.PASSWORD, STEP_TIME)
-    auto_action("Privacy", "class", "icheckbox", "click", "", STEP_TIME)
-    auto_action("Enter Panel", "name", "commit", "click", "", STEP_TIME)
-    Wait(driver, 60).until(
-        EC.presence_of_element_located((By.XPATH, f"//a[contains(text(), '{runtime.REGEX_CONTINUE}')]"))
-    )
-    info_logger(LOG_FILE_NAME, "[LOGIN] Successful!", True)
-
-def get_date():
     try:
-        session = driver.get_cookie("_yatri_session")["value"]
-        script = JS_SCRIPT % (runtime.DATE_URL, session)
-        content = driver.execute_script(script)
-        return json.loads(content)
-    except:
+        match find_by.lower():
+            case "id":
+                item = driver.find_element(By.ID, el_type)
+            case "name":
+                item = driver.find_element(By.NAME, el_type)
+            case "class":
+                item = driver.find_element(By.CLASS_NAME, el_type)
+            case "xpath":
+                item = driver.find_element(By.XPATH, el_type)
+            case _:
+                print(" Fail (неверный find_by)")
+                return
+        match action.lower():
+            case "send":
+                item.send_keys(value)
+            case "click":
+                item.click()
+            case _:
+                print(" Fail (неверное действие)")
+                return
+        print(" Check!")
+        if sleep_time:
+            time.sleep(sleep_time)
+    except Exception as e:
+        print(f" Fail (ошибка: {str(e)[:50]})")
+
+
+def start_process(driver):
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            print(f"Попытка входа #{attempt + 1}")
+            driver.get(runtime.SIGN_IN_LINK)
+
+            # Увеличьте таймаут и добавьте проверку альтернативных элементов
+            try:
+                Wait(driver, 30).until(EC.presence_of_element_located((By.NAME, "commit")))
+            except:
+                # Проверьте, если страница уже загрузилась с другими элементами
+                if "sign_in" in driver.current_url:
+                    print("Элемент 'commit' не найден, проверяем другие элементы...")
+
+                # Проверка по ID
+                try:
+                    Wait(driver, 10).until(EC.presence_of_element_located((By.ID, "new_user")))
+                    print("Найдена форма по ID 'new_user'")
+                except:
+                    pass
+
+            # Добавьте задержку для полной загрузки
+            time.sleep(3)
+
+            # Попробуйте найти элементы по разным селекторам
+            try:
+                auto_action(driver, "Click bounce", "xpath", '//a[@class="down-arrow bounce"]', "click",
+                            sleep_time=STEP_TIME)
+            except:
+                print("Элемент bounce не найден, продолжаем...")
+
+            auto_action(driver, "Email", "id", "user_email", "send", runtime.USERNAME, STEP_TIME)
+            auto_action(driver, "Password", "id", "user_password", "send", runtime.PASSWORD, STEP_TIME)
+
+            # Попробуйте разные способы найти checkbox
+            try:
+                auto_action(driver, "Privacy", "class", "icheckbox", "click", "", STEP_TIME)
+            except:
+                try:
+                    auto_action(driver, "Privacy", "xpath", "//input[@type='checkbox']", "click", "", STEP_TIME)
+                except:
+                    print("Чекбокс не найден")
+
+            auto_action(driver, "Enter Panel", "name", "commit", "click", "", STEP_TIME)
+
+            # Увеличьте таймаут проверки успешного входа
+            try:
+                Wait(driver, 30).until(
+                    EC.presence_of_element_located(
+                        (By.XPATH, f"//a[contains(text(), '{runtime.REGEX_CONTINUE}')]")
+                    )
+                )
+                info_logger("[LOGIN] Successful!", True)
+                return  # Успешный выход из функции
+
+            except TimeoutException:
+                # Проверка, не появилась ли ошибка
+                page_source = driver.page_source.lower()
+                if "invalid" in page_source or "error" in page_source or "incorrect" in page_source:
+                    msg = "❌ Ошибка входа: неверные данные"
+                    info_logger(msg, True)
+                    raise RuntimeError("LOGIN_FAILED")
+
+                # Сохраним скриншот для отладки
+                try:
+                    driver.save_screenshot(f"logs/screenshots/debug_login_{attempt}.png")
+                except:
+                    pass
+
+                print(f"Попытка #{attempt + 1} неудачна, повтор через 5 секунд...")
+                if attempt < max_retries - 1:
+                    time.sleep(5)
+                    continue
+                else:
+                    # Последняя попытка также не удалась
+                    msg = (
+                        "❌ Ошибка входа в аккаунт после нескольких попыток.\n\n"
+                        "Возможные причины:\n"
+                        "• неверный логин или пароль\n"
+                        "• аккаунт заблокирован\n"
+                        "• требуется капча\n"
+                        "• проблемы с сетью\n\n"
+                        "Мониторинг остановлен."
+                    )
+                    info_logger(msg, True)
+                    raise RuntimeError("LOGIN_FAILED")
+
+        except Exception as e:
+            print(f"Исключение в start_process: {e}")
+            if attempt == max_retries - 1:
+                msg = (
+                    f"❌ Критическая ошибка входа: {str(e)[:100]}\n\n"
+                    "Мониторинг остановлен."
+                )
+                info_logger(msg, True)
+                raise RuntimeError("LOGIN_FAILED")
+            time.sleep(5)
+
+
+def select_consulate(driver):
+    facility = runtime.FACILITY_ID
+    info_logger(f"DEBUG: Выбор консульства с facility_id = {facility}")
+
+    try:
+        # Ждём, пока элемент станет доступным
+        Wait(driver, 10).until(
+            EC.presence_of_element_located((By.ID, "appointments_consulate_appointment_facility_id"))
+        )
+
+        # Выполняем выбор консульства
+        driver.execute_script("""
+            const select = document.getElementById('appointments_consulate_appointment_facility_id');
+            if (!select) return false;
+            
+            select.value = arguments[0];
+            
+            // Триггерим все необходимые события
+            select.dispatchEvent(new Event('change', { bubbles: true }));
+            select.dispatchEvent(new Event('input', { bubbles: true }));
+            
+            // Также можно вызвать onchange, если он есть
+            if (typeof select.onchange === 'function') {
+                select.onchange();
+            }
+            
+            return true;
+        """, facility)
+
+        # Ждём, пока страница обновится (либо URL изменится, либо появится индикатор загрузки)
+        info_logger("⏳ Ожидание обновления страницы после выбора консульства...")
+        time.sleep(random.uniform(3, 5))
+
+        # Проверяем, что выбор сохранился
+        for attempt in range(5):
+            try:
+                current_value = driver.execute_script("""
+                    const select = document.getElementById('appointments_consulate_appointment_facility_id');
+                    return select ? select.value : '';
+                """)
+
+                if current_value == facility:
+                    info_logger(f"✅ Консульство выбрано и сохранено (facility_id = {facility})")
+
+                    # Даём дополнительное время на загрузку данных календаря
+                    info_logger("⏳ Ожидание загрузки данных календаря...")
+                    time.sleep(random.uniform(2, 4))
+
+                    return True
+                else:
+                    info_logger(f"⚠️ Значение не сохранилось. Попытка {attempt + 1}/5")
+                    time.sleep(1)
+            except Exception as e:
+                info_logger(f"⚠️ Ошибка проверки: {e}")
+                time.sleep(1)
+
+        info_logger("❌ Не удалось выбрать консульство после нескольких попыток")
+        return False
+
+    except TimeoutException:
+        info_logger("❌ Таймаут при ожидании элемента select")
+        return False
+    except Exception as e:
+        info_logger(f"❌ Ошибка в select_consulate: {e}")
+        return False
+
+
+def get_date(driver):
+    try:
+        info_logger(f"DEBUG: DATE_URL = {runtime.DATE_URL}")
+        info_logger(f"DEBUG: APPOINTMENT_URL = {runtime.APPOINTMENT_URL}")
+
+        # НЕ ПЕРЕЗАГРУЖАЕМ СТРАНИЦУ! Мы уже на нужной странице после select_consulate()
+        # driver.get(runtime.APPOINTMENT_URL)  # УБЕРИТЕ ЭТУ СТРОКУ!
+
+        # Вместо этого просто ждём немного
+        time.sleep(random.uniform(1.5, 3))
+
+        # Упростите вызов без дополнительных аргументов
+        url1 = runtime.DATE_URL.strip()
+
+        # Добавим отладочную информацию
+        info_logger(f"📡 Отправка запроса по URL: {url1}")
+
+        content1 = driver.execute_script("""
+            return fetch(arguments[0], {
+                method: 'GET',
+                headers: {
+                    'Accept': 'application/json, text/javascript, */*; q=0.01',
+                    'X-Requested-With': 'XMLHttpRequest'
+                },
+                credentials: 'include'
+            }).then(r => r.text());
+        """, url1)
+
+        url2 = url1.replace("expedite=false", "expedite=true")
+        content2 = driver.execute_script("""
+            return fetch(arguments[0], {
+                method: 'GET',
+                headers: {
+                    'Accept': 'application/json, text/javascript, */*; q=0.01',
+                    'X-Requested-With': 'XMLHttpRequest'
+                },
+                credentials: 'include'
+            }).then(r => r.text());
+        """, url2)
+
+        # Логируем размеры ответов для отладки
+        if content1:
+            info_logger(f"📄 Ответ обычного запроса: {len(content1)} символов")
+        if content2:
+            info_logger(f"📄 Ответ expedite запроса: {len(content2)} символов")
+
+        for label, content in [("обычный", content1), ("expedite", content2)]:
+            if not content or content.strip() == "":
+                info_logger(f"⚠️ {label} запрос вернул пустой ответ")
+                continue
+            if content.lstrip().startswith("<"):
+                info_logger(f"⚠️ {label} запрос вернул HTML вместо JSON (возможно, сессия истекла)")
+                continue
+            low = content.lower()
+            if "sign in" in low or "session" in low or "csrf" in low:
+                info_logger(f"🔑 {label} запрос: сессия истекла")
+                return "SESSION_EXPIRED"
+            try:
+                data = json.loads(content)
+                if isinstance(data, list):
+                    if data:
+                        info_logger(f"✅ Даты получены через {label} запрос! Найдено {len(data)} дат")
+                        # Логируем первые несколько дат для отладки
+                        for i, date_info in enumerate(data[:5]):
+                            date_str = date_info.get('date', 'N/A')
+                            business_day = date_info.get('business_day', 'N/A')
+                            info_logger(f"  📅 {i + 1}: {date_str} (бизнес дней: {business_day})")
+                        return data
+                    else:
+                        info_logger(f"⚠️ {label} запрос вернул пустой список дат")
+                else:
+                    info_logger(f"⚠️ {label} запрос вернул не список: {type(data)}")
+                    info_logger(f"📄 Содержимое: {content[:200]}")
+            except json.JSONDecodeError as e:
+                info_logger(f"❌ Ошибка парсинга JSON в {label} запросе: {e}")
+                info_logger(f"📄 Содержимое ответа (первые 500 символов): {content[:500]}")
+                continue
+            except Exception as e:
+                info_logger(f"❌ Ошибка обработки {label} запроса: {e}")
+                continue
+
+        info_logger("📭 Все запросы вернули пустые или некорректные данные")
+        return []
+
+    except Exception as e:
+        info_logger(f"❌ get_date error: {e}")
+        info_logger(f"❌ Traceback: {traceback.format_exc()}")
         return None
 
-def get_time(date):
-    time_url = runtime.TIME_URL % date
-    session = driver.get_cookie("_yatri_session")["value"]
-    script = JS_SCRIPT % (time_url, session)
-    content = driver.execute_script(script)
-    data = json.loads(content)
-    times = data.get("available_times")
-    return times[-1] if times else None
+
+def get_time(driver, date):
+    try:
+        consulate = select_consulate(driver)
+        if not consulate:
+            info_logger("❌ Не удалось выбрать консульство в get_time")
+            return None
+
+        time.sleep(random.uniform(2, 4))
+
+        time_url = runtime.TIME_URL % (runtime.FACILITY_ID, date)
+        info_logger(f"📡 Запрос времени по URL: {time_url}")
+
+        content = driver.execute_script("""
+            return fetch(arguments[0], {
+                method: 'GET',
+                headers: {
+                    'Accept': 'application/json, text/javascript, */*; q=0.01',
+                    'X-Requested-With': 'XMLHttpRequest'
+                },
+                credentials: 'include'
+            }).then(r => r.text());
+        """, time_url)
+
+        if not content or content.lstrip().startswith("<"):
+            info_logger("⚠️ get_time: пустой ответ или HTML")
+            return None
+
+        data = json.loads(content)
+        times = data.get("available_times")
+        if times:
+            info_logger(f"✅ Доступные времена: {times}")
+            return times
+
+        info_logger("⚠️ get_time: нет доступных времен")
+        return None
+
+    except Exception as e:
+        info_logger(f"❌ get_time error: {e}")
+        return None
+
 
 def get_available_date(dates):
-    PED = datetime.datetime.strptime(runtime.PERIOD_END, "%Y-%m-%d")
-    PSD = datetime.datetime.strptime(runtime.PERIOD_START, "%Y-%m-%d")
-    for d in dates:
-        date = d.get("date")
-        if not date:
-            continue
-        try:
-            new_date = datetime.datetime.strptime(date, "%Y-%m-%d")
-            if PSD < new_date < PED:
-                return date
-        except ValueError:
-            continue
+    if not dates:
+        return None
+
+    try:
+        PED = datetime.datetime.strptime(runtime.PERIOD_END, "%Y-%m-%d")
+        PSD = datetime.datetime.strptime(runtime.PERIOD_START, "%Y-%m-%d")
+        for d in dates:
+            date = d.get("date")
+            if not date:
+                continue
+            try:
+                new_date = datetime.datetime.strptime(date, "%Y-%m-%d")
+                if PSD < new_date < PED:
+                    return date
+            except ValueError:
+                continue
+    except Exception as e:
+        info_logger(f"❌ get_available_date error: {e}")
+
     return None
 
-# ---------- Telegram Bot ----------
-# Состояния только для добавления
+
+# ---------- Telegram Bot Handlers ----------
 (
     WAITING_USERNAME,
     WAITING_PASSWORD,
@@ -349,7 +672,6 @@ def get_available_date(dates):
     WAITING_EMBASSY
 ) = range(6)
 
-# Состояния для редактирования
 (
     SELECTING_FIELD,
     EDITING_FIELD
@@ -357,7 +679,6 @@ def get_available_date(dates):
 
 user_sessions = {}
 
-# Соответствие полей и меток
 FIELD_LABELS = {
     "username": "📧 Email",
     "password": "🔒 Пароль",
@@ -369,9 +690,10 @@ FIELD_LABELS = {
 
 FIELD_KEYS = list(FIELD_LABELS.keys())
 
-# --- Основные команды ---
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await cmd_menu(update, context)
+
 
 async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
@@ -385,12 +707,13 @@ async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=False)
     await update.message.reply_text("Выберите действие:", reply_markup=reply_markup)
 
-# --- Добавление (без изменений) ---
+
 async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_sessions[user_id] = {}
     await update.message.reply_text("📧 Введите email:")
     return WAITING_USERNAME
+
 
 async def receive_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -398,11 +721,13 @@ async def receive_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔒 Введите пароль:")
     return WAITING_PASSWORD
 
+
 async def receive_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_sessions[user_id]["PASSWORD"] = update.message.text.strip()
     await update.message.reply_text("🔢 Введите SCHEDULE_ID:")
     return WAITING_SCHEDULE_ID
+
 
 async def receive_schedule_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -410,23 +735,27 @@ async def receive_schedule_id(update: Update, context: ContextTypes.DEFAULT_TYPE
     await update.message.reply_text("📅 Введите Дату начала (например, 2026-01-01):")
     return WAITING_PERIOD_START
 
+
 async def receive_period_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_sessions[user_id]["PERIOD_START"] = update.message.text.strip()
     await update.message.reply_text("📆 Введите Дату окончания (например, 2026-12-31):")
     return WAITING_PERIOD_END
 
+
 async def receive_period_end(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_sessions[user_id]["PERIOD_END"] = update.message.text.strip()
-    await update.message.reply_text("🌍 Введите код посольства (например, en-ru-ast):")
+    await update.message.reply_text("🌍 Введите код посольства (например, Astana, Almata):")
     return WAITING_EMBASSY
+
 
 async def receive_embassy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     embassy = update.message.text.strip()
     if embassy not in Embassies:
-        await update.message.reply_text(f"❌ Неизвестный код посольства: {embassy}. Доступные: {', '.join(Embassies.keys())}")
+        await update.message.reply_text(
+            f"❌ Неизвестный код посольства: {embassy}. Доступные: {', '.join(Embassies.keys())}")
         return WAITING_EMBASSY
 
     user_sessions[user_id]["YOUR_EMBASSY"] = embassy
@@ -435,7 +764,7 @@ async def receive_embassy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Аккаунт сохранён! ID: {account_id}")
     return ConversationHandler.END
 
-# --- Редактирование (НОВАЯ ЛОГИКА) ---
+
 async def cmd_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not context.args:
@@ -455,7 +784,6 @@ async def cmd_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_sessions[user_id] = {"editing_id": account_id}
 
-    # Формируем сообщение с текущими значениями
     msg = f"✏️ <b>Редактирование аккаунта ID {account_id}</b>\n\nВыберите поле для изменения:\n"
     for key in FIELD_KEYS:
         current = acc[key.upper()] if key != "embassy_code" else acc["YOUR_EMBASSY"]
@@ -466,6 +794,7 @@ async def cmd_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, parse_mode="HTML", reply_markup=reply_markup)
     return SELECTING_FIELD
 
+
 async def select_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text.strip()
@@ -474,6 +803,7 @@ async def select_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if user_id in user_sessions:
             del user_sessions[user_id]
         await update.message.reply_text("❌ Редактирование отменено.")
+        await cmd_menu(update, context)
         return ConversationHandler.END
 
     selected_key = None
@@ -489,6 +819,7 @@ async def select_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_sessions[user_id]["editing_field"] = selected_key
     acc = get_account_by_id(user_sessions[user_id]["editing_id"])
     current_val = acc[selected_key.upper()] if selected_key != "embassy_code" else acc["YOUR_EMBASSY"]
+
     await update.message.reply_text(
         f"✏️ Введите новое значение для <b>{FIELD_LABELS[selected_key]}</b>:\n"
         f"Текущее: <code>{current_val}</code>\n"
@@ -496,6 +827,7 @@ async def select_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="HTML"
     )
     return EDITING_FIELD
+
 
 async def edit_field_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -505,6 +837,7 @@ async def edit_field_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not account_id or not field_key:
         await update.message.reply_text("❌ Сессия повреждена. Начните заново.")
+        await cmd_menu(update, context)
         return ConversationHandler.END
 
     text = update.message.text.strip()
@@ -522,7 +855,7 @@ async def edit_field_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
         del user_sessions[user_id]
     return ConversationHandler.END
 
-# --- Список и информация ---
+
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     accounts = get_accounts_for_user(user_id)
@@ -533,6 +866,7 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for acc in accounts:
         msg += f"ID: {acc[0]} | {acc[1]} | {acc[2]} | {acc[3]} — {acc[4]}\n"
     await update.message.reply_text(msg)
+
 
 async def cmd_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -566,6 +900,7 @@ async def cmd_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(msg, parse_mode="HTML")
 
+
 async def cmd_use(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not context.args:
@@ -589,7 +924,7 @@ async def cmd_use(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Аккаунт ID {account_id} выбран. Перезапуск...")
     os.execv(sys.executable, ['python'] + sys.argv)
 
-# --- Удаление ---
+
 async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not context.args:
@@ -622,9 +957,10 @@ async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("❌ Не удалось удалить аккаунт.")
 
-# --- Обработка кнопок меню ---
+
 async def handle_add_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await cmd_add(update, context)
+
 
 async def handle_edit_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -632,8 +968,10 @@ async def handle_edit_button(update: Update, context: ContextTypes.DEFAULT_TYPE)
         parse_mode="HTML"
     )
 
+
 async def handle_list_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await cmd_list(update, context)
+
 
 async def handle_use_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -641,11 +979,13 @@ async def handle_use_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="HTML"
     )
 
+
 async def handle_info_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Введите ID аккаунта:\n<code>/info ID</code>",
         parse_mode="HTML"
     )
+
 
 async def handle_delete_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -653,13 +993,15 @@ async def handle_delete_button(update: Update, context: ContextTypes.DEFAULT_TYP
         parse_mode="HTML"
     )
 
-# --- Запуск бота ---
+
 async def run_telegram_bot():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # Обработчик добавления
     add_conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("add", cmd_add)],
+        entry_points=[
+            CommandHandler("add", cmd_add),
+            MessageHandler(filters.Regex("^➕ Добавить аккаунт$"), cmd_add),
+        ],
         states={
             WAITING_USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_username)],
             WAITING_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_password)],
@@ -671,7 +1013,6 @@ async def run_telegram_bot():
         fallbacks=[]
     )
 
-    # Обработчик редактирования
     edit_conv_handler = ConversationHandler(
         entry_points=[CommandHandler("edit", cmd_edit)],
         states={
@@ -690,7 +1031,6 @@ async def run_telegram_bot():
     app.add_handler(add_conv_handler)
     app.add_handler(edit_conv_handler)
 
-    app.add_handler(MessageHandler(filters.Regex("^➕ Добавить аккаунт$"), handle_add_button))
     app.add_handler(MessageHandler(filters.Regex("^✏️ Редактировать аккаунт$"), handle_edit_button))
     app.add_handler(MessageHandler(filters.Regex("^📋 Мои аккаунты$"), handle_list_button))
     app.add_handler(MessageHandler(filters.Regex("^✅ Выбрать аккаунт$"), handle_use_info))
@@ -702,40 +1042,157 @@ async def run_telegram_bot():
     await app.updater.start_polling()
     await asyncio.Event().wait()
 
+
 def start_telegram_bot():
     asyncio.run(run_telegram_bot())
 
-# ---------- Monitor Loop ----------
+
+def by_pass_limit_confirmation(driver):
+    try:
+        # Находим визуальный элемент чекбокса (div с классами icheckbox)
+        # Селектор ищет div, который находится непосредственно перед input с нужным ID
+        visual_checkbox = driver.find_element(By.XPATH,
+                                              "//input[@id='confirmed_limit_message']/parent::div[contains(@class, 'icheckbox')]")
+
+        print("✅ Найден визуальный элемент чекбокса")
+
+        # Проверяем, не отмечен ли он уже (опционально, можно убрать)
+        # Обычно у отмеченного icheckbox добавляется класс 'checked'
+        if 'checked' not in visual_checkbox.get_attribute('class'):
+            visual_checkbox.click()
+            print("✅ Чекбокс отмечен (клик по визуальному div)")
+        else:
+            print("ℹ️ Чекбокс уже был отмечен")
+        time.sleep(random.uniform(3, 5))
+        # Далее ищем и нажимаем кнопку submit
+        submit_elements = driver.find_elements(By.CSS_SELECTOR,
+                                               "input[type='submit'], button[type='submit']")
+        if submit_elements:
+            submit_elements[0].click()
+            time.sleep(random.uniform(3, 5))
+            print(f"✅ Нажата submit кнопка (тег: {submit_elements[0].tag_name})")
+        else:
+            print("❌ Кнопка submit не найдена")
+
+    except Exception as e:
+        print(f"❌ Ошибка при работе с чекбоксом: {e}")
+
+
 def monitor_loop():
+    driver = None
     first_loop = True
-    Req_count = 0
-    t0 = time.time()
+    req_count = 0
     previous_dates = set()
 
     while True:
         try:
             if first_loop:
-                start_process()
-                first_loop = False
-                Req_count = 0
-                t0 = time.time()
+                if driver:
+                    try:
+                        driver.quit()
+                    except:
+                        pass
 
-            Req_count += 1
-            msg = f"\n{'-'*60}\nRequest #{Req_count} at {datetime.datetime.now()}\n"
-            info_logger(LOG_FILE_NAME, msg)
+                options = uc.ChromeOptions()
+                options.add_argument("--no-sandbox")
+                options.add_argument("--disable-dev-shm-usage")
+                options.add_argument("--disable-gpu")
+                options.add_argument("--window-size=1920,1080")
+                options.add_argument("--disable-blink-features=AutomationControlled")
 
-            dates = get_date()
-            while dates is None:
-                info_logger(LOG_FILE_NAME, "Даты недоступны, повтор...")
-                time.sleep(1)
-                dates = get_date()
+                print("Инициализация ChromeDriver")
+
+                try:
+                    driver = uc.Chrome(options=options)
+                    print("✅ ChromeDriver успешно инициализирован")
+
+                except Exception as e:
+                    print(f"❌ Ошибка: {e}")
+                    print("Попробуем другой способ...")
+
+                    try:
+                        # Вариант 2: С указанием пути для Apple Silicon
+                        driver = uc.Chrome(
+                            options=options,
+                            driver_executable_path="/opt/homebrew/bin/chromedriver"
+                        )
+                        print("✅ ChromeDriver успешно инициализирован (Apple Silicon путь)")
+
+                    except Exception as e2:
+                        print(f"❌ Ошибка: {e2}")
+                        print("Пожалуйста, разрешите ChromeDriver в Настройках безопасности Mac")
+                        time.sleep(10)
+                        continue
+
+                # Увеличьте таймаут для start_process
+                try:
+                    print("Выполнение входа в систему...")
+                    start_process(driver)
+                    first_loop = False
+                    req_count = 0
+                    info_logger("[LOGIN] Successful!", True)
+
+                    # Имитация просмотра календаря...
+                    info_logger("👀 Имитация просмотра календаря...")
+                    driver.get(runtime.APPOINTMENT_URL)
+                    time.sleep(random.uniform(5, 10))
+
+                except Exception as e:
+                    print(f"❌ Ошибка в start_process: {e}")
+                    first_loop = True
+                    time.sleep(30)
+                    continue
+
+            req_count += 1
+            msg = f"\n{'-' * 60}\nRequest #{req_count} at {datetime.datetime.now()}\n"
+            info_logger(msg)
+
+            # 1. Переходим на страницу записи
+            info_logger("🔄 Переход на страницу записи...")
+            driver.get(runtime.APPOINTMENT_URL)
+            time.sleep(random.uniform(4, 7))
+
+            by_pass_limit_confirmation(driver)
+
+            # 2. Выбираем консульство
+            info_logger("🏛️ Выбор консульства...")
+            consulate = select_consulate(driver)
+            if not consulate:
+                info_logger("❌ Консульство не выбрано, перезапуск...", True)
+                first_loop = True
+                time.sleep(30)
+                continue
+
+            # 3. Проверяем даты (НЕ перезагружаем страницу!)
+            info_logger("📅 Проверка доступных дат...")
+            dates = get_date(driver)
+            retry_count = 0
+            while dates in (None, "BUSY", "SESSION_EXPIRED"):
+                if dates == "SESSION_EXPIRED":
+                    info_logger("🔄 Сессия истекла — перезаход...", True)
+                    first_loop = True
+                    break
+                elif dates == "BUSY":
+                    info_logger("⚠️ Сайт занят, пауза 5 сек...")
+                    time.sleep(5)
+                else:
+                    info_logger("Даты недоступны, повтор через 1 сек...")
+                    time.sleep(1)
+                dates = get_date(driver)
+                retry_count += 1
+                if retry_count > 30:
+                    info_logger("❌ Сайт долго недоступен — перезаход...", True)
+                    first_loop = True
+                    break
+
+            if first_loop:
+                continue
 
             if not dates:
-                info_logger(LOG_FILE_NAME, "Список пуст, возможно бан", True)
-                send_notification("BAN", "Возможен бан, перерыв...")
-                driver.get(runtime.SIGN_OUT_LINK)
-                time.sleep(BAN_COOLDOWN_TIME * hour)
-                first_loop = True
+                info_logger("Список дат пуст, ждем следующий цикл...", True)
+                wait = random.uniform(RETRY_TIME_L_BOUND, RETRY_TIME_U_BOUND)
+                info_logger(f"Следующий запрос через {wait:.1f} сек")
+                time.sleep(wait)
                 continue
 
             filtered_dates = []
@@ -755,46 +1212,83 @@ def monitor_loop():
             current_dates = set(filtered_dates)
             if current_dates:
                 filtered_msg = "📅 Доступные даты в периоде:\n" + "\n".join(sorted(current_dates))
-                info_logger(LOG_FILE_NAME, filtered_msg, True)
+                info_logger(filtered_msg, True)
             else:
-                info_logger(LOG_FILE_NAME, "❌ Нет дат в указанном периоде.", True)
+                info_logger("❌ Нет дат в указанном периоде.", True)
 
             new_dates = current_dates - previous_dates
             if new_dates:
                 new_msg = "🆕 Новые даты в периоде:\n" + "\n".join(sorted(new_dates))
-                info_logger(LOG_FILE_NAME, new_msg, True)
+                info_logger(new_msg, True)
             previous_dates = current_dates
 
-            date_to_book = get_available_date(dates)
-            if date_to_book:
-                time_slot = get_time(date_to_book)
-                if time_slot:
-                    slot_msg = f"✅ Доступный слот: {date_to_book} {time_slot}"
-                    info_logger(LOG_FILE_NAME, slot_msg, True)
+            if dates:
+                all_slots_message = "📅 Все доступные слоты:\n"
 
-            t1 = time.time()
-            total_time = t1 - t0
-            if total_time > WORK_LIMIT_TIME * hour or Req_count > REQUEST_COUNT:
-                rest_msg = f"💤 Перерыв после {total_time/hour:.1f} ч / {Req_count} запросов"
-                info_logger(LOG_FILE_NAME, rest_msg, True)
-                send_notification("REST", rest_msg)
-                driver.get(runtime.SIGN_OUT_LINK)
-                time.sleep(WORK_COOLDOWN_TIME * hour)
+                for date in dates:
+                    available_times = get_time(driver, date)
+                    time.sleep(random.uniform(2, 4))
+                    if available_times:
+                        all_slots_message += f"\n📌 <b>{date.get('date')}</b>:\n"
+                        for i, time_slot in enumerate(available_times, 1):
+                            all_slots_message += f"  {i}. {time_slot}\n"
+
+                info_logger(all_slots_message, True)
+
+            if req_count >= 70:
+                info_logger("🔄 Обновление сессии: перезаход в аккаунт...")
                 first_loop = True
                 continue
 
             wait = random.uniform(RETRY_TIME_L_BOUND, RETRY_TIME_U_BOUND)
-            info_logger(LOG_FILE_NAME, f"Следующий запрос через {wait:.1f} сек")
+            info_logger(f"Следующий запрос через {wait:.1f} сек")
             time.sleep(wait)
 
-        except Exception as e:
-            logging.exception(e)
-            err = f"❌ Ошибка: {e}"
-            info_logger(LOG_FILE_NAME, err, True)
+        except RuntimeError as e:
+            if str(e) == "LOGIN_FAILED":
+                info_logger("🛑 Ошибка авторизации. Повтор через 5 минут...", True)
+                if driver:
+                    try:
+                        driver.quit()
+                    except:
+                        pass
+                driver = None
+                first_loop = True
+                time.sleep(300)
+            else:
+                raise
+
+        except Exception:
+            import traceback
+            error_msg = f"❌ КРИТИЧЕСКАЯ ОШИБКА:\n{traceback.format_exc()}"
+            info_logger(error_msg, True)
+            if driver:
+                try:
+                    driver.quit()
+                except:
+                    pass
+            driver = None
+            first_loop = True
             time.sleep(60)
 
-# ---------- Main ----------
+
 if __name__ == "__main__":
+    print("=" * 60)
+    print("Запуск Visa Bot Monitor")
+    print(f"Время запуска: {datetime.datetime.now()}")
+    print("=" * 60)
+
     init_db()
-    threading.Thread(target=start_telegram_bot, daemon=True).start()
+
+    prepare_log_folders_and_clean()
+
+    telegram_thread = threading.Thread(target=start_telegram_bot, daemon=True)
+    telegram_thread.start()
+
+    time.sleep(2)
+
+    print("Telegram бот запущен в фоновом режиме")
+    print("Запуск основного цикла мониторинга...")
+    print("=" * 60)
+
     monitor_loop()
